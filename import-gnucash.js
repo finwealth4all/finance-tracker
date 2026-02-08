@@ -198,15 +198,33 @@ async function main() {
     await client.query('DELETE FROM accounts WHERE user_id = $1', [userId]);
     console.log('   ✅ Cleaned');
 
-    // ── Step 4: Create accounts ──
+    // ── Step 4: Create accounts (handle duplicate short names) ──
     console.log('\n📝 Creating accounts...');
     const accountIdMap = new Map(); // fullName → account_id
 
+    // Find duplicate short names
+    const shortNameCount = new Map();
     for (const [fullName, acc] of uniqueAccounts) {
+      const key = acc.shortName;
+      shortNameCount.set(key, (shortNameCount.get(key) || 0) + 1);
+    }
+
+    for (const [fullName, acc] of uniqueAccounts) {
+      const key = acc.shortName;
+      // If short name is duplicate within same type, use a more specific name
+      let displayName = acc.shortName;
+      if (shortNameCount.get(key) > 1) {
+        // Use last 2 parts of path for uniqueness, e.g. "Taxes > Income Tax"
+        const parts = fullName.split(':');
+        displayName = parts.length >= 2 
+          ? `${parts[parts.length - 2].trim()} > ${parts[parts.length - 1].trim()}`
+          : fullName;
+      }
+
       const result = await client.query(
         `INSERT INTO accounts (user_id, account_name, account_type, sub_type, description, currency)
          VALUES ($1, $2, $3, $4, $5, 'INR') RETURNING account_id`,
-        [userId, acc.shortName.substring(0, 250), acc.type, acc.subType, fullName]
+        [userId, displayName.substring(0, 250), acc.type, acc.subType, fullName]
       );
       accountIdMap.set(fullName, result.rows[0].account_id);
     }
