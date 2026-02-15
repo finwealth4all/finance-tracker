@@ -182,24 +182,55 @@ function parseExcel(filePath) {
     return parseCSV(csv);
 }
 
-// --- PDF Parser ---
+// --- PDF Parser (using pdfjs-dist directly for proper password support) ---
 async function parsePDF(filePath, password) {
-    const pdfParse = require('pdf-parse');
+    const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
     const dataBuffer = fs.readFileSync(filePath);
-    const options = {};
-    if (password) options.password = password;
+    const uint8Array = new Uint8Array(dataBuffer);
 
-    let data;
+    // Load PDF with password support
+    const loadingTask = pdfjsLib.getDocument({
+        data: uint8Array,
+        password: password || undefined,
+        useSystemFonts: true
+    });
+
+    // Handle password prompts from PDF.js
+    loadingTask.onPassword = (updatePassword, reason) => {
+        if (reason === 1 && password) {
+            // First request — supply the password
+            updatePassword(password);
+        } else if (reason === 2) {
+            // Wrong password
+            throw new Error('PDF is password-protected. The password you provided is incorrect.');
+        } else {
+            throw new Error('PDF is password-protected. Please provide the correct password.');
+        }
+    };
+
+    let pdfDoc;
     try {
-        data = await pdfParse(dataBuffer, options);
+        pdfDoc = await loadingTask.promise;
     } catch (err) {
-        if (err.message && err.message.includes('password')) {
+        const msg = (err.message || '').toLowerCase();
+        if (msg.includes('password') || msg.includes('encrypted')) {
+            if (password) {
+                throw new Error('PDF is password-protected. The password you provided is incorrect. Please check and try again.');
+            }
             throw new Error('PDF is password-protected. Please provide the correct password.');
         }
         throw err;
     }
 
-    const text = data.text;
+    // Extract text from all pages
+    const textParts = [];
+    for (let i = 1; i <= pdfDoc.numPages; i++) {
+        const page = await pdfDoc.getPage(i);
+        const content = await page.getTextContent();
+        const pageText = content.items.map(item => item.str).join(' ');
+        textParts.push(pageText);
+    }
+    const text = textParts.join('\n');
     const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
 
     // Detect bank from content
