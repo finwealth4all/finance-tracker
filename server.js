@@ -239,7 +239,43 @@ app.delete('/api/accounts/:id', authenticateToken, async (req, res) => {
 // =============================================
 // TRANSACTIONS ROUTES (Double-Entry)
 // =============================================
-
+// ── Period summary (income/expense/net totals via SQL) ──
+app.get('/api/transactions/summary', authenticateToken, async (req, res) => {
+    try {
+        const { start_date, end_date, account_id } = req.query;
+        let dateFilter = '';
+        const params = [req.user.userId];
+        if (account_id) {
+            params.push(account_id);
+            dateFilter += ` AND (t.debit_account_id = $${params.length} OR t.credit_account_id = $${params.length})`;
+        }
+        if (start_date) {
+            params.push(start_date);
+            dateFilter += ` AND t.date >= $${params.length}`;
+        }
+        if (end_date) {
+            params.push(end_date);
+            dateFilter += ` AND t.date <= $${params.length}`;
+        }
+        const result = await pool.query(`
+            SELECT
+                COALESCE(SUM(CASE WHEN ca.account_type = 'Income' THEN t.amount ELSE 0 END), 0) as total_income,
+                COALESCE(SUM(CASE WHEN da.account_type = 'Expense' THEN t.amount ELSE 0 END), 0) as total_expense,
+                COUNT(*) as transaction_count
+            FROM transactions t
+            JOIN accounts da ON t.debit_account_id = da.account_id
+            JOIN accounts ca ON t.credit_account_id = ca.account_id
+            WHERE t.user_id = $1 ${dateFilter}
+        `, params);
+        const row = result.rows[0];
+        const income = parseFloat(row.total_income);
+        const expense = parseFloat(row.total_expense);
+        res.json({ income, expense, net: income - expense, transaction_count: parseInt(row.transaction_count) });
+    } catch (err) {
+        console.error('Summary error:', err);
+        res.status(500).json({ error: 'Failed to get summary' });
+    }
+});
 // Get transactions (with filters and pagination)
 app.get('/api/transactions', authenticateToken, async (req, res) => {
     try {
