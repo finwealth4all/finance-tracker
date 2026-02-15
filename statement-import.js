@@ -33,10 +33,27 @@ const upload = multer({
 // DATABASE SETUP - Creates tables on first run
 // ===================================================
 async function initImportTables(pool) {
+    // Migration: Check if tables exist with wrong column types (INT instead of UUID)
+    // If so, drop and recreate them. This is safe because staged data is temporary.
+    try {
+        const check = await pool.query(`
+            SELECT data_type FROM information_schema.columns
+            WHERE table_name = 'staged_transactions' AND column_name = 'user_id'
+        `);
+        if (check.rows.length > 0 && check.rows[0].data_type !== 'uuid') {
+            console.log('🔄 Migrating import tables from INT to UUID...');
+            await pool.query('DROP TABLE IF EXISTS staged_transactions CASCADE');
+            await pool.query('DROP TABLE IF EXISTS category_rules CASCADE');
+            console.log('✅ Old tables dropped, will recreate with UUID columns');
+        }
+    } catch (e) {
+        console.log('Migration check skipped:', e.message);
+    }
+
     await pool.query(`
         CREATE TABLE IF NOT EXISTS staged_transactions (
             id SERIAL PRIMARY KEY,
-            user_id INT NOT NULL,
+            user_id UUID NOT NULL,
             batch_id VARCHAR(50) NOT NULL,
             date DATE,
             description TEXT,
@@ -44,8 +61,8 @@ async function initImportTables(pool) {
             transaction_type VARCHAR(10) DEFAULT 'debit',
             balance DECIMAL(15,2),
             suggested_category VARCHAR(100) DEFAULT 'Uncategorized',
-            suggested_debit_account_id INT,
-            suggested_credit_account_id INT,
+            suggested_debit_account_id UUID,
+            suggested_credit_account_id UUID,
             confidence DECIMAL(3,2) DEFAULT 0,
             status VARCHAR(20) DEFAULT 'pending',
             source_file VARCHAR(255),
@@ -54,11 +71,11 @@ async function initImportTables(pool) {
         );
         CREATE TABLE IF NOT EXISTS category_rules (
             id SERIAL PRIMARY KEY,
-            user_id INT NOT NULL,
+            user_id UUID NOT NULL,
             pattern VARCHAR(500) NOT NULL,
             category VARCHAR(100),
-            debit_account_id INT,
-            credit_account_id INT,
+            debit_account_id UUID,
+            credit_account_id UUID,
             account_type VARCHAR(20),
             hit_count INT DEFAULT 1,
             created_at TIMESTAMP DEFAULT NOW(),
@@ -355,7 +372,7 @@ async function autoClassify(pool, userId, transactions, sourceAccountId) {
     const accounts = accountsResult.rows;
 
     // Find the source account
-    const sourceAccount = sourceAccountId ? accounts.find(a => a.account_id === parseInt(sourceAccountId)) : null;
+    const sourceAccount = sourceAccountId ? accounts.find(a => String(a.account_id) === String(sourceAccountId)) : null;
 
     // Default category mappings (Indian context)
     const defaultRules = [
