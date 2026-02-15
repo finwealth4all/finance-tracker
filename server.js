@@ -15,6 +15,7 @@ const multer = require('multer');
 const Papa = require('papaparse');
 const fs = require('fs');
 const path = require('path');
+const { createImportRoutes, initImportTables } = require('./statement-import');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -813,6 +814,11 @@ async function initializeDatabase() {
 
 // ===== START SERVER =====
 initializeDatabase().then(() => {
+    // Initialize statement import tables
+    initImportTables(pool).catch(err => console.error('Import tables error:', err));
+    // Mount statement import routes
+    app.use('/api/import', createImportRoutes(pool, authenticateToken));
+
     app.listen(PORT, () => {
         console.log(`\n🚀 Finance Tracker API running on port ${PORT}`);
         console.log(`📊 Health check: http://localhost:${PORT}/health`);
