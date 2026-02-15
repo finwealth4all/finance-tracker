@@ -15,7 +15,24 @@ const multer = require('multer');
 const Papa = require('papaparse');
 const fs = require('fs');
 const path = require('path');
+const { createImportRoutes, initImportTables } = require('./statement-import');
+```
 
+Then find the line where the server starts listening (near the bottom), something like:
+```
+app.listen(PORT,
+initImportTables(pool).catch(err => console.error('Import tables error:', err));
+app.use('/api/import', createImportRoutes(pool, authenticateToken));
+```
+
+Commit.
+
+## Step 3: Update package.json (add 2 packages)
+
+Open **package.json** → find the `"dependencies"` section → add these two:
+```
+"pdf-parse": "^1.1.1",
+"xlsx": "^0.18.5"
 const app = express();
 const PORT = process.env.PORT || 3000;
 
