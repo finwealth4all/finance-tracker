@@ -97,9 +97,15 @@ async function initImportTables(pool) {
 function parseDate(str) {
     if (!str) return null;
     str = str.trim();
-    // DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY
+    // DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY (4-digit year)
     let m = str.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
     if (m) return `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+    // DD/MM/YY or DD-MM-YY or DD.MM.YY (2-digit year)
+    m = str.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2})$/);
+    if (m) {
+        const yr = parseInt(m[3]) > 50 ? '19' + m[3] : '20' + m[3];
+        return `${yr}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+    }
     // YYYY-MM-DD
     m = str.match(/^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})$/);
     if (m) return `${m[1]}-${m[2].padStart(2,'0')}-${m[3].padStart(2,'0')}`;
@@ -212,17 +218,10 @@ async function parsePDF(filePath, password) {
         useSystemFonts: true
     });
 
-    // Handle password prompts from PDF.js
     loadingTask.onPassword = (updatePassword, reason) => {
-        if (reason === 1 && password) {
-            // First request — supply the password
-            updatePassword(password);
-        } else if (reason === 2) {
-            // Wrong password
-            throw new Error('PDF is password-protected. The password you provided is incorrect.');
-        } else {
-            throw new Error('PDF is password-protected. Please provide the correct password.');
-        }
+        if (reason === 1 && password) { updatePassword(password); }
+        else if (reason === 2) { throw new Error('PDF is password-protected. The password you provided is incorrect.'); }
+        else { throw new Error('PDF is password-protected. Please provide the correct password.'); }
     };
 
     let pdfDoc;
@@ -231,52 +230,228 @@ async function parsePDF(filePath, password) {
     } catch (err) {
         const msg = (err.message || '').toLowerCase();
         if (msg.includes('password') || msg.includes('encrypted')) {
-            if (password) {
-                throw new Error('PDF is password-protected. The password you provided is incorrect. Please check and try again.');
-            }
+            if (password) throw new Error('PDF is password-protected. The password you provided is incorrect. Please check and try again.');
             throw new Error('PDF is password-protected. Please provide the correct password.');
         }
         throw err;
     }
 
-    // Extract text from all pages
-    const textParts = [];
+    // ===== POSITION-AWARE TEXT EXTRACTION =====
+    // Extract text items with X,Y coordinates to reconstruct the table structure
+    const allItems = [];
     for (let i = 1; i <= pdfDoc.numPages; i++) {
         const page = await pdfDoc.getPage(i);
         const content = await page.getTextContent();
-        const pageText = content.items.map(item => item.str).join(' ');
-        textParts.push(pageText);
+        const viewport = page.getViewport({ scale: 1.0 });
+        for (const item of content.items) {
+            if (!item.str || item.str.trim() === '') continue;
+            // Transform coordinates — PDF Y is bottom-up, we flip to top-down
+            const tx = item.transform;
+            const x = Math.round(tx[4]);
+            const y = Math.round(viewport.height - tx[5]);
+            allItems.push({ text: item.str.trim(), x, y, page: i });
+        }
     }
-    const text = textParts.join('\n');
-    const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
 
-    // Detect bank from content
-    const fullText = text.toLowerCase();
+    // ===== GROUP INTO ROWS BY Y-POSITION =====
+    // Items within 4px of each other vertically are on the same row
+    allItems.sort((a, b) => a.page - b.page || a.y - b.y || a.x - b.x);
+    const rows = [];
+    let currentRow = [];
+    let currentY = -999;
+    let currentPage = -1;
+
+    for (const item of allItems) {
+        if (item.page !== currentPage || Math.abs(item.y - currentY) > 4) {
+            if (currentRow.length > 0) rows.push(currentRow);
+            currentRow = [item];
+            currentY = item.y;
+            currentPage = item.page;
+        } else {
+            currentRow.push(item);
+        }
+    }
+    if (currentRow.length > 0) rows.push(currentRow);
+
+    // Sort items within each row by X position and build row text
+    const textRows = rows.map(row => {
+        row.sort((a, b) => a.x - b.x);
+        return { items: row, text: row.map(r => r.text).join('  ') };
+    });
+
+    // ===== DETECT BANK TYPE =====
+    const fullText = textRows.map(r => r.text).join(' ').toLowerCase();
     let bankType = 'generic';
     if (fullText.includes('hdfc bank')) bankType = 'hdfc';
     else if (fullText.includes('state bank of india') || fullText.includes('sbi')) bankType = 'sbi';
     else if (fullText.includes('icici bank')) bankType = 'icici';
-    else if (fullText.includes('hdfc') && (fullText.includes('credit card') || fullText.includes('card number'))) bankType = 'hdfc_cc';
-    else if (fullText.includes('sbi') && (fullText.includes('credit card') || fullText.includes('card number') || fullText.includes('sbicard'))) bankType = 'sbi_cc';
-    else if (fullText.includes('icici') && (fullText.includes('credit card') || fullText.includes('card number'))) bankType = 'icici_cc';
-
+    else if (fullText.includes('axis bank')) bankType = 'axis';
+    else if (fullText.includes('kotak')) bankType = 'kotak';
+    if (fullText.includes('credit card') || fullText.includes('card number') || fullText.includes('card no')) bankType += '_cc';
     console.log(`Detected bank type: ${bankType}`);
 
+    // ===== FIND HEADER ROW & COLUMN POSITIONS =====
+    // Look for the header row that contains column titles
+    const headerKeywords = ['date', 'narration', 'description', 'particulars', 'withdrawal', 'deposit', 'debit', 'credit', 'balance', 'chq', 'ref'];
+    let headerRowIdx = -1;
+    let headerItems = [];
+
+    for (let i = 0; i < textRows.length; i++) {
+        const rowText = textRows[i].text.toLowerCase();
+        const matchCount = headerKeywords.filter(k => rowText.includes(k)).length;
+        if (matchCount >= 3) {
+            headerRowIdx = i;
+            headerItems = textRows[i].items;
+            break;
+        }
+    }
+
+    console.log(`Header row found at index: ${headerRowIdx}, text: ${headerRowIdx >= 0 ? textRows[headerRowIdx].text : 'NOT FOUND'}`);
+
+    if (headerRowIdx < 0) {
+        // Fallback: try line-based parsing if no header found
+        console.log('No table header found, falling back to line-based parsing');
+        return parsePDFLineBased(textRows, bankType);
+    }
+
+    // ===== MAP COLUMN POSITIONS FROM HEADER =====
+    // Identify which X-ranges correspond to which columns
+    const colMap = { date: null, narration: null, ref: null, valueDate: null, withdrawal: null, deposit: null, balance: null };
+
+    for (const item of headerItems) {
+        const t = item.text.toLowerCase();
+        if (t.includes('date') && !t.includes('value') && !colMap.date) colMap.date = item.x;
+        else if ((t.includes('value') && t.includes('dt')) || (t.includes('value') && t.includes('date'))) colMap.valueDate = item.x;
+        else if (t.includes('narration') || t.includes('description') || t.includes('particulars') || t.includes('detail')) colMap.narration = item.x;
+        else if (t.includes('chq') || t.includes('ref') || t.includes('cheque')) colMap.ref = item.x;
+        else if (t.includes('withdrawal') || t.includes('debit') || (t === 'dr' || t === 'dr.')) colMap.withdrawal = item.x;
+        else if (t.includes('deposit') || t.includes('credit') || (t === 'cr' || t === 'cr.')) colMap.deposit = item.x;
+        else if (t.includes('balance') || t.includes('closing')) colMap.balance = item.x;
+    }
+
+    // If we couldn't find specific withdrawal/deposit, look for "amount" columns
+    if (!colMap.withdrawal && !colMap.deposit) {
+        const amtItems = headerItems.filter(i => i.text.toLowerCase().includes('amount') || i.text.toLowerCase().includes('amt'));
+        if (amtItems.length >= 2) {
+            colMap.withdrawal = Math.min(...amtItems.map(i => i.x));
+            colMap.deposit = Math.max(...amtItems.map(i => i.x));
+        }
+    }
+
+    console.log('Column positions:', JSON.stringify(colMap));
+
+    // ===== EXTRACT TRANSACTIONS FROM DATA ROWS =====
     const transactions = [];
-    // Date pattern at start of line
+    const dateRegex = /^\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}$/;
+
+    // Process rows after header
+    let i = headerRowIdx + 1;
+    while (i < textRows.length) {
+        const row = textRows[i];
+        const items = row.items;
+
+        // Check if this row starts with a date
+        const firstItemText = items[0]?.text || '';
+        if (!dateRegex.test(firstItemText)) { i++; continue; }
+
+        const date = parseDate(firstItemText);
+        if (!date) { i++; continue; }
+
+        // Collect items for this transaction (may span multiple visual rows)
+        let txItems = [...items];
+
+        // Look ahead for continuation lines (narration often wraps to next lines)
+        let j = i + 1;
+        while (j < textRows.length) {
+            const nextRow = textRows[j];
+            const nextFirst = nextRow.items[0]?.text || '';
+            // Stop if next row starts with a date or is a summary/total row
+            if (dateRegex.test(nextFirst)) break;
+            if (nextFirst.toLowerCase().includes('total') || nextFirst.toLowerCase().includes('opening') ||
+                nextFirst.toLowerCase().includes('closing') || nextFirst.toLowerCase().includes('statement')) break;
+            // This is a continuation — add items
+            txItems = txItems.concat(nextRow.items);
+            j++;
+        }
+
+        // Now map items to columns based on X-position
+        let narrationParts = [];
+        let withdrawal = 0;
+        let deposit = 0;
+        let balance = null;
+        let refNo = '';
+
+        // Build column boundaries for classification
+        // For each item, find which column it's closest to
+        const numericRegex = /^[\d,]+\.\d{2}$/;
+
+        for (const item of txItems) {
+            const t = item.text;
+            if (t === firstItemText && item === items[0]) continue; // Skip the date itself
+
+            if (numericRegex.test(t.replace(/,/g, '').trim()) || numericRegex.test(t.replace(/[,\s]/g, ''))) {
+                // This is a number — determine which column
+                const val = parseAmount(t);
+                if (val === 0) continue;
+
+                // Find closest column by X-position
+                const x = item.x;
+                const distances = {};
+                if (colMap.withdrawal) distances.withdrawal = Math.abs(x - colMap.withdrawal);
+                if (colMap.deposit) distances.deposit = Math.abs(x - colMap.deposit);
+                if (colMap.balance) distances.balance = Math.abs(x - colMap.balance);
+
+                const closest = Object.entries(distances).sort((a, b) => a[1] - b[1])[0];
+                if (closest) {
+                    if (closest[0] === 'withdrawal') withdrawal = val;
+                    else if (closest[0] === 'deposit') deposit = val;
+                    else if (closest[0] === 'balance') balance = val;
+                }
+            } else if (colMap.ref && Math.abs(item.x - colMap.ref) < 60) {
+                // Reference number area
+                if (/^\d{5,}/.test(t)) refNo = (refNo + ' ' + t).trim();
+                else narrationParts.push(t);
+            } else if (colMap.valueDate && Math.abs(item.x - colMap.valueDate) < 40 && dateRegex.test(t)) {
+                // Value date — skip
+            } else {
+                // Part of narration
+                narrationParts.push(t);
+            }
+        }
+
+        const description = narrationParts.join(' ').replace(/\s+/g, ' ').trim();
+        let amount = 0;
+        let txType = 'debit';
+
+        if (withdrawal > 0) { amount = withdrawal; txType = 'debit'; }
+        else if (deposit > 0) { amount = deposit; txType = 'credit'; }
+
+        if (amount > 0 && description.length > 0) {
+            transactions.push({ date, description: refNo ? `${description} [Ref: ${refNo}]` : description, amount, transaction_type: txType, balance });
+            console.log(`  TX: ${date} | ${txType.toUpperCase()} | ₹${amount} | ${description.substring(0, 50)}...`);
+        }
+
+        i = j; // Skip to next transaction row
+    }
+
+    console.log(`Extracted ${transactions.length} transactions from PDF`);
+    return transactions;
+}
+
+// Fallback line-based parser when no table header is found
+function parsePDFLineBased(textRows, bankType) {
+    const transactions = [];
     const dateRegex = /^(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{1,2}[\s\-][A-Za-z]{3}[\s\-]\d{2,4})/;
-    // Amount pattern (Indian format)
     const amountRegex = /[\d,]+\.\d{2}/g;
 
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
+    for (let i = 0; i < textRows.length; i++) {
+        const line = textRows[i].text;
         const dateMatch = line.match(dateRegex);
         if (!dateMatch) continue;
 
         const date = parseDate(dateMatch[1]);
         if (!date) continue;
 
-        // Extract all amounts from the line
         const amounts = [];
         let amtMatch;
         const amtStr = line.slice(dateMatch[0].length);
@@ -284,72 +459,37 @@ async function parsePDF(filePath, password) {
         while ((amtMatch = amtRegex2.exec(amtStr)) !== null) {
             amounts.push({ value: parseAmount(amtMatch[0]), index: amtMatch.index });
         }
-
         if (amounts.length === 0) continue;
 
-        // Extract description: text between date and first amount
-        const firstAmtPos = line.indexOf(amounts[0].value.toFixed(2).replace(/(\d)(?=(\d{2})+\d\.)/g, '$1,'));
-        let description = '';
-        if (amounts.length > 0) {
-            // Get text between date and amounts area
-            const afterDate = line.slice(dateMatch[0].length);
-            const match = afterDate.match(/^[\s]*(.*?)[\s]*[\d,]+\.\d{2}/);
-            if (match) description = match[1].replace(/\s+/g, ' ').trim();
+        // Get description
+        const afterDate = line.slice(dateMatch[0].length);
+        const descMatch = afterDate.match(/^\s*(.*?)\s*[\d,]+\.\d{2}/);
+        let description = descMatch ? descMatch[1].replace(/\s+/g, ' ').trim() : '';
+
+        if (description.length < 5 && i + 1 < textRows.length && !textRows[i + 1].text.match(dateRegex)) {
+            description = (description + ' ' + textRows[i + 1].text).trim();
         }
 
-        // Sometimes description spans multiple lines
-        if (description.length < 5 && i + 1 < lines.length && !lines[i + 1].match(dateRegex)) {
-            description = (description + ' ' + lines[i + 1]).trim();
-        }
-
-        // Determine debit/credit based on number of amount columns
         let amount, txType, balance;
-
         if (amounts.length >= 3) {
-            // Pattern: Withdrawal | Deposit | Balance (most bank statements)
-            // Find which column has the value (non-zero)
             if (amounts[0].value > 0 && (amounts.length < 3 || amounts[1].value === 0)) {
-                amount = amounts[0].value;
-                txType = 'debit';
-                balance = amounts[amounts.length - 1].value;
-            } else if (amounts.length >= 2 && amounts[1].value > 0) {
-                amount = amounts[1].value;
-                txType = 'credit';
-                balance = amounts[amounts.length - 1].value;
-            } else {
-                amount = amounts[0].value;
-                txType = 'debit';
-                balance = amounts[amounts.length - 1].value;
-            }
+                amount = amounts[0].value; txType = 'debit'; balance = amounts[amounts.length - 1].value;
+            } else if (amounts[1].value > 0) {
+                amount = amounts[1].value; txType = 'credit'; balance = amounts[amounts.length - 1].value;
+            } else { amount = amounts[0].value; txType = 'debit'; balance = amounts[amounts.length - 1].value; }
         } else if (amounts.length === 2) {
-            // Could be: Amount | Balance  OR  two amounts
-            amount = amounts[0].value;
-            balance = amounts[1].value;
-            // Heuristic: if second amount is much larger, it's likely the balance
-            txType = 'debit'; // Default, user can correct
+            amount = amounts[0].value; balance = amounts[1].value; txType = 'debit';
         } else {
-            // Single amount (common in CC statements)
-            amount = amounts[0].value;
-            txType = 'debit';
-            balance = null;
+            amount = amounts[0].value; txType = 'debit'; balance = null;
         }
 
-        // Credit card statements: most entries are debits (purchases)
         if (bankType.includes('_cc')) {
             txType = 'debit';
-            // Check for CR/credit indicators
-            if (line.toLowerCase().includes(' cr') || line.toLowerCase().includes('credit') ||
-                line.toLowerCase().includes('refund') || line.toLowerCase().includes('cashback') ||
-                line.toLowerCase().includes('reversal') || line.toLowerCase().includes('payment received')) {
-                txType = 'credit';
-            }
+            if (/\b(cr|credit|refund|cashback|reversal|payment received)\b/i.test(line)) txType = 'credit';
         }
 
-        if (amount > 0) {
-            transactions.push({ date, description, amount, transaction_type: txType, balance });
-        }
+        if (amount > 0) transactions.push({ date, description, amount, transaction_type: txType, balance });
     }
-
     return transactions;
 }
 
